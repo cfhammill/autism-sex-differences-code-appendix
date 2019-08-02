@@ -1,0 +1,1016 @@
+---
+title: Generate the paper figures
+author: Chris Hammill
+date: April 24, 2018
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(cache.lazy = FALSE)
+suppressPackageStartupMessages({
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+    library(grid)
+    library(magick)
+    library(lenses)
+})
+```
+
+
+Now let's read in the spatial model results and extract the results
+
+```{r}
+extract_res <-
+  function(res_df)
+    mutate(res_df
+         , concordance = lapply(res, getElement, "concordance")
+         , eff_cor = lapply(res, getElement, "eff_cor")
+         , max_mb = sapply(res, getElement, "max_mb")
+         , max_fb = sapply(res, getElement, "max_fb")
+         , max_meff = sapply(res, getElement, "max_meff")
+         , max_feff = sapply(res, getElement, "max_feff")
+         , split = case_when(split == "TRUE"     ~ "All Subjects"
+                           , split == "x > 100"  ~ "IQ > 100"
+                           , split == "x > 85"   ~ "IQ > 85"
+                           , TRUE                ~ "unused")
+         , measures = case_when(measures == "thickness" ~ "Thickness"
+                              , measures == "area"      ~ "Area"
+                              , measures == "volume"    ~ "Volume"
+                              , measures == "mean_curv" ~ "Mean Curvature")
+         , group =
+             case_when(!match_iq & !iq_modelled ~ paste("IQ not matched and not modelled,", split)
+                      , match_iq & iq_modelled ~ paste("IQ matched and modelled,", split))
+           )
+
+vert_res <-
+  readRDS("../2018-07-24_full-analysis-lmer/merged_experiments.rds") %>%
+  #filter out thickness results then add the updated tlaplace ones
+  filter(measures != "thickness") %>%
+  bind_rows(readRDS("../2019-05-22_thickness-update/analysis/merged_experiments.rds")) %>%
+  ungroup %>%
+  extract_res %>%
+  filter(split != "unused") %>%
+  mutate(run = "cortex")
+
+vol_res <-
+  readRDS("../2018-08-13_volume-analysis-lmer/merged_experiments.rds") %>%
+  ungroup %>%
+  extract_res %>%
+  filter(split != "unused") %>%
+  mutate(run = "subcortex")
+```
+
+First let's make a function to extract the measure specific data, and functions to plot the data.
+
+```{r}
+generate_vertex_concordance_data <-
+  function(res, measure){
+    steps <- length(res$concordance[[1]])
+    lst(vert_conc =
+          res %>%
+          filter(measures == measure) %>%
+          select(-eff_cor, -res) %>%
+          mutate(step = list(seq_len(steps) / steps)) %>%
+          unnest %>%
+          filter(step != 1) 
+        
+      , vert_conc_bounds =
+          vert_conc %>%
+          filter(!is.na(shuffle)) %>%
+          ungroup %>%
+          group_by(measures, step, group) %>%
+          summarize(ub = quantile(concordance, .975)
+                  , lb = quantile(concordance, .025))
+      , measure = measure      
+        )
+  }
+
+plot_vertex_concordance_measure <-
+  function(vertex_data, ylim = NULL){
+    with(vertex_data, {
+      vpl <-
+        vert_conc %>%
+        filter(is.na(shuffle)) %>%
+        ggplot(aes(x = step, y = concordance, group = group)) +
+        geom_ribbon(data = vert_conc_bounds
+                  , aes(x = step, ymin = lb, ymax = ub
+                      , y = NULL, group = group, color = NULL)
+                  , fill = "grey") +
+        geom_line(col = "red") +
+        facet_wrap(~ group) +
+        ggtitle(measure) +
+        scale_x_continuous(name = "Effect threshold (% of maximum)") +
+        scale_y_continuous(name = "Sign concordances (% of vertices)"
+                         , limits = ylim) +
+        theme_bw() +
+        theme(plot.title = element_text(hjust = 0.5))
+    })
+  }
+
+generate_vertex_similarity_data <-
+  function(res, measure){
+    steps <- length(res$eff_cor[[1]])
+    if(steps <= 20){
+      step_interval <- c(0, seq(.1,.9,.1), seq(.9,.98,.01))
+    } else {
+      step_interval <- c(0, seq(.1,.9,.1)
+                       , seq(.9,.99,.01)
+                       , seq(.99,.999,.001))
+    }      
+    
+    lst(
+      vert_conc =
+        res %>%
+        filter(measures == measure) %>%
+        select(-concordance, -res) %>%
+        mutate(step =
+                 list(step_interval)) %>%
+        unnest %>%
+        filter(step != 1) 
+    
+    , vert_conc_bounds =
+        vert_conc %>%
+        ungroup %>%
+        group_by(measures, step, group) %>%
+        summarize(ub = quantile(eff_cor, .975)
+                , lb = quantile(eff_cor, .025))
+    , measure = measure      
+    )
+  }
+
+plot_vertex_similarity_measure <-
+  function(vertex_data, ylim = NULL){
+    with(vertex_data, {
+      vpl <-
+        vert_conc %>%
+        filter(is.na(shuffle)) %>%
+        ggplot(aes(x = step, y = eff_cor, group = group)) +
+        geom_ribbon(data = vert_conc_bounds
+                  , aes(x = step, ymin = lb, ymax = ub
+                      , y = NULL, group = NULL, color = NULL)
+                  , fill = "grey") +
+        geom_line(col = "red") +
+        facet_wrap(~ group) +
+        ggtitle(measure) +
+        scale_x_continuous(name = "Effect quantile (sex specific)") +
+        scale_y_continuous(name = "Effect Correlation", limits = ylim) +
+        theme_bw() +
+        theme(plot.title = element_text(hjust = 0.5))
+    })
+  }
+
+plot_all_measures <-
+  function(plots){
+    grid.newpage()
+    top <- viewport(layout = grid.layout(2,2))
+    gpl <-
+      pushViewport(
+        vpTree(top
+             , vpList(viewport(layout.pos.col = 1
+                             , layout.pos.row = 1
+                             , name = "tl")
+                    , viewport(layout.pos.col = 2
+                             , layout.pos.row = 1
+                             , name = "tr")
+                    , viewport(layout.pos.col = 1
+                             , layout.pos.row = 2
+                             , name = "bl")
+                    , viewport(layout.pos.col = 2
+                             , layout.pos.row = 2
+                             , name = "br")
+                      )
+               )
+      )
+
+    tlp <- plots[[1]]
+    trp <- plots[[2]]
+    blp <- plots[[3]]
+    brp <- plots[[4]]
+
+    seekViewport("tl")
+    grid.draw(ggplotGrob(tlp))
+    seekViewport("tr")
+    grid.draw(ggplotGrob(trp))
+    seekViewport("bl")
+    grid.draw(ggplotGrob(blp))
+    seekViewport("br")
+    grid.draw(ggplotGrob(brp))
+  }
+```
+
+## Threshold plots
+
+```{r}
+ppr_groups <- c("IQ not matched and not modelled, All Subjects"
+              , "IQ matched and modelled, All Subjects")
+
+## Concordance
+pdf("ppr-figures/2019-06-28_poster-vertex-sign-concordance.pdf", height = 8, width = 14)
+
+vcd <- map(c("Thickness", "Area", "Volume", "Mean Curvature")
+         , generate_vertex_concordance_data, res = vert_res)
+
+vcd_max <-
+  max(
+    map_dbl(vcd
+          , function(d) max(d$vert_conc$concordance, d$vert_conc_bounds$ub)))
+
+vcd_min <-
+  min(
+    map_dbl(vcd
+          , function(d) min(d$vert_conc$concordance, d$vert_conc_bounds$lb)))
+
+
+map(vcd, plot_vertex_concordance_measure, ylim = c(vcd_min, vcd_max)) %>%
+  plot_all_measures
+
+## Concordance
+pdf("ppr-figures/2019-06-28_ppr-vertex-sign-concordance.pdf", height = 8, width = 14)
+
+vcd_ppr <-
+  map(c("Thickness", "Area", "Volume", "Mean Curvature")
+    , generate_vertex_concordance_data, res = vert_res)  %>%
+  map(~ list(vert_conc = filter(.$vert_conc, group %in% ppr_groups)
+           , vert_conc_bounds = filter(.$vert_conc_bounds, group %in% ppr_groups)
+           , measure = .$measure))                    
+
+vcd_ppr_max <-
+  max(
+    map_dbl(vcd_ppr
+          , function(d) max(d$vert_conc$concordance, d$vert_conc_bounds$ub)))
+
+vcd_ppr_min <-
+  min(
+    map_dbl(vcd_ppr
+          , function(d) min(d$vert_conc$concordance, d$vert_conc_bounds$lb)))
+
+
+map(vcd_ppr, plot_vertex_concordance_measure
+  , ylim = c(vcd_ppr_min, vcd_ppr_max)) %>%
+  plot_all_measures
+
+dev.off()
+####
+
+## Concordance
+pdf("ppr-figures/2019-06-28_ppr-filter-vertex-sign-concordance.pdf"
+  , heigh = 8, width = 14)
+
+vcd_ppr_filt <-
+  map(c("Thickness", "Area", "Volume", "Mean Curvature")
+    , generate_vertex_concordance_data, res = vert_res)  %>%
+  map(~ list(vert_conc = filter(.$vert_conc, !group %in% ppr_groups)
+           , vert_conc_bounds = filter(.$vert_conc_bounds, !group %in% ppr_groups)
+           , measure = .$measure))                    
+
+vcd_ppr_filt_max <-
+  max(
+    map_dbl(vcd_ppr_filt
+          , function(d) max(d$vert_conc$concordance, d$vert_conc_bounds$ub)))
+
+vcd_ppr_filt_min <-
+  min(
+    map_dbl(vcd_ppr_filt
+          , function(d) min(d$vert_conc$concordance, d$vert_conc_bounds$lb)))
+
+
+map(vcd_ppr_filt, plot_vertex_concordance_measure
+  , ylim = c(vcd_ppr_filt_min, vcd_ppr_filt_max)) %>%
+  plot_all_measures
+
+dev.off()
+####
+
+pdf("ppr-figures/2019-06-28_curv-vertex-concordance.pdf", height = 4, width = 8)
+vert_res %>%
+  filter(split == "All Subjects" & match_iq) %>%
+  generate_vertex_concordance_data("Mean Curvature") %>%
+  plot_vertex_concordance_measure %>%
+  print
+dev.off()
+
+## Similarity
+pdf("ppr-figures/2019-06-28_poster-vertex-correlation.pdf", heigh = 8, width = 14)
+
+vsd <-
+  map(c("Thickness", "Area", "Volume", "Mean Curvature")
+    , generate_vertex_similarity_data, res = vert_res)
+
+vsd_max <-
+  max(
+    map_dbl(vsd
+          , function(d) max(d$vert_conc$eff_cor, d$vert_conc_bounds$ub)))
+
+vsd_min <-
+  min(
+    map_dbl(vsd
+          , function(d) min(d$vert_conc$eff_cor, d$vert_conc_bounds$lb)))
+
+
+map(vsd, plot_vertex_similarity_measure, ylim = c(vsd_min, vsd_max)) %>%
+  plot_all_measures
+
+
+dev.off()
+
+## Similarity ppr
+pdf("ppr-figures/2019-06-28_ppr-vertex-correlation.pdf", heigh = 8, width = 14)
+
+vsd_ppr <-
+  map(c("Thickness", "Area", "Volume", "Mean Curvature")
+    , generate_vertex_similarity_data, res = vert_res) %>%
+  map(~ list(vert_conc = filter(.$vert_conc, group %in% ppr_groups)
+           , vert_conc_bounds = filter(.$vert_conc_bounds, group %in% ppr_groups)
+           , measure = .$measure))    
+
+vsd_ppr_max <-
+  max(
+    map_dbl(vsd_ppr
+          , function(d) max(d$vert_conc$eff_cor, d$vert_conc_bounds$ub)))
+
+vsd_ppr_min <-
+  min(
+    map_dbl(vsd_ppr
+          , function(d) min(d$vert_conc$eff_cor, d$vert_conc_bounds$lb)))
+
+
+map(vsd_ppr, plot_vertex_similarity_measure, ylim = c(vsd_ppr_min, vsd_ppr_max)) %>%
+  plot_all_measures
+
+
+dev.off()
+####
+
+## Similarity ppr iq-filter
+pdf("ppr-figures/2019-06-28_ppr-filter-vertex-correlation.pdf"
+  , heigh = 8, width = 14)
+
+vsd_ppr_filt <-
+  map(c("Thickness", "Area", "Volume", "Mean Curvature")
+    , generate_vertex_similarity_data, res = vert_res) %>%
+  map(~ list(vert_conc = filter(.$vert_conc, !group %in% ppr_groups)
+           , vert_conc_bounds = filter(.$vert_conc_bounds, !group %in% ppr_groups)
+           , measure = .$measure))    
+
+vsd_ppr_filt_max <-
+  max(
+    map_dbl(vsd_ppr_filt
+          , function(d) max(d$vert_conc$eff_cor, d$vert_conc_bounds$ub)))
+
+vsd_ppr_filt_min <-
+  min(
+    map_dbl(vsd_ppr_filt
+          , function(d) min(d$vert_conc$eff_cor, d$vert_conc_bounds$lb)))
+
+
+map(vsd_ppr_filt, plot_vertex_similarity_measure
+  , ylim = c(vsd_ppr_filt_min, vsd_ppr_filt_max)) %>%
+  plot_all_measures
+
+
+dev.off()
+####
+
+png("ppr-figures/2019-06-28_curv-vertex-similarity.png", height = 4, width = 6)
+vert_res %>%
+  filter(split == "All Subjects" & match_iq) %>%
+  generate_vertex_similarity_data("Mean Curvature") %>%
+  plot_vertex_similarity_measure %>%
+  print
+dev.off()
+```
+
+## Volume Figures
+
+```{r}
+
+### Volume plot
+sccd <-
+  plot_vertex_concordance_measure(
+    generate_vertex_concordance_data(vol_res, "Volume"))
+  
+
+scsd <-
+  plot_vertex_similarity_measure(
+    generate_vertex_similarity_data(vol_res, "Volume"))
+
+pdf("ppr-figures/2019-06-28_volume-plots.pdf", height = 4, width = 14)
+grid.newpage()
+top <- viewport(layout = grid.layout(1,2))
+
+pushViewport(
+  vpTree(top
+         , vpList(viewport(layout.pos.col = 1
+                         , layout.pos.row = 1
+                         , name = "lv")
+                , viewport(layout.pos.col = 2
+                         , layout.pos.row = 1
+                         , name = "rv")
+                  )))
+
+seekViewport("lv")
+grid.draw(ggplotGrob(sccd))
+popViewport()
+seekViewport("rv")
+grid.draw(ggplotGrob(scsd))
+
+dev.off()
+#####
+
+pdf("ppr-figures/2019-06-28_volume-concordance.pdf", height = 4, width = 6)
+vol_res %>%
+  filter(split == "All Subjects" ) %>% #& match_iq) %>%
+  generate_vertex_concordance_data("Volume") %>%
+  plot_vertex_concordance_measure %>%
+  print
+dev.off()
+
+pdf("ppr-figures/2019-06-28_volume-similarity.pdf", height = 4, width = 6)
+vol_res %>%
+  filter(split == "All Subjects" & match_iq) %>%
+  mutate(split = sub(", All Subjects", "", split)) %>%  
+  generate_vertex_similarity_data("Volume") %>%
+  plot_vertex_similarity_measure %>%
+  print
+dev.off()
+```
+
+## 3D Figures
+
+First I will need to get the cortex objects. 
+
+```{r}
+load("../data/cortical_masks.rda")
+
+surface_left <-
+  read_obj("../data/CIVET_2.1/Linux-x86_64/CIVET-2.1.0/models/icbm/icbm_avg_mid_sym_mc_left.obj")
+
+surface_right <-
+  read_obj("../data/CIVET_2.1/Linux-x86_64/CIVET-2.1.0/models/icbm/icbm_avg_mid_sym_mc_right.obj")
+
+aal21_left_mask <- 
+  readLines("../data/CIVET_2.1/Linux-x86_64/CIVET-2.1.0/models/icbm/AAL/icbm_avg_mid_mc_AAL_left.txt") %>%
+  as.numeric %>%
+  `==`(0) %>%
+  .[1:ncol(surface_left$vertex_matrix)]
+
+aal21_right_mask <- 
+  readLines("../data/CIVET_2.1/Linux-x86_64/CIVET-2.1.0/models/icbm/AAL/icbm_avg_mid_mc_AAL_right.txt") %>%
+  as.numeric %>%
+  `==`(0) %>%
+  .[1:ncol(surface_right$vertex_matrix)]
+```
+
+load the pooled resuts
+
+```{r}
+## Use vertexwise analyses, this part hasn't changed since 12-2017
+load("../cortical/model_selection_assets.rda")
+load("../cortical/model_selection_results.rda")
+reg <- batchtools::loadRegistry("../cortical/vertexwise_analyses/")
+
+tlaplace <- new.env()
+evalq({
+  load("../laplace/model_selection_results.rda")
+
+  best_models <-
+    best_models %>%
+    ungroup %>%
+    rename(evidence_ratio_new = evidence_ratio
+         , model_string_new = model_string)
+}, tlaplace)
+
+best_models <-
+  best_models %>%
+  ungroup %>%
+  left_join(tlaplace$best_models
+           , by = c("match_iq", "split", "measures", "iq_modelled")) %>%
+  mutate(model_string =
+           ifelse(is.na(model_string_new), model_string, model_string_new)
+       , evidence_ration =
+           ifelse(is.na(evidence_ratio_new), evidence_ratio, evidence_ratio_new))
+  
+
+experiment_frame_filtered <-
+  experiment_frame %>%
+  ungroup %>%
+  filter(!grepl("<", split)) 
+
+model_frame <-
+  inner_join(ungroup(best_models), experiment_frame_filtered %>% select(-set)
+           , by = c("match_iq", "split")) %>%
+  mutate(job = 1:n()) %>%
+  filter(set_number == 2
+       , match_iq
+       , split == "TRUE"
+       , measures == "mean_curv")
+
+mean_tAll <-
+  batchtools::reduceResultsList(model_frame$job)[[1]]
+
+mean_tAll_res <-
+  mean_tAll %>%
+  as.data.frame %>%
+  mutate(fconc = `beta-Dx` + `beta-sex2:Dx`)
+
+
+max_t_All <-
+  mean_tAll_res %>%
+  summarize(fconc_max = max(abs(fconc))
+          , mconc_max = max(abs(`beta-Dx`))) %>%
+  unlist %>%
+  max
+
+
+t_sign_conc <-
+  mean_tAll_res %>%
+  mutate(sign_conc = sign(`beta-Dx`) == sign(`beta-sex2:Dx`)
+       , above_thresh =
+           abs(fconc) > .7 * max_t_All |
+           abs(`beta-Dx`) > .7 * max_t_All
+       , thresh_conc = ifelse(above_thresh, sign_conc, NA)
+         )
+```
+
+Split the data
+
+
+```{r}
+left_data <- rep(NA, length(aal_left_mask))
+left_data[aal_left_mask] <-
+  t_sign_conc$thresh_conc %>%
+  { .[rep(c(FALSE,TRUE), each = length(.)/2)] }
+
+left_data[is.na(left_data) | aal21_left_mask] <- NA
+left_data <- as.numeric(left_data)
+
+right_data <- rep(NA, length(aal_right_mask))
+right_data[aal_right_mask] <-
+  t_sign_conc$thresh_conc %>%
+  { .[rep(c(TRUE, FALSE), each = length(.)/2)] }
+
+right_data[is.na(right_data) | aal21_right_mask] <- NA
+right_data <- as.numeric(right_data)
+
+overall_concordance <- t_sign_conc$thresh_conc %>% mean(na.rm = TRUE)
+```
+
+Now plot
+
+```{r}
+lrot <-
+  structure(c(-0.36468568444252, 0.233791545033455, -0.901301145553589,  0
+            , -0.859384834766388, 0.288080215454102, 0.422451555728912,  0
+            , 0.358413130044937, 0.928627490997314, 0.0958582237362862,  0
+            , 0, 0, 0, 1), .Dim = c(4L, 4L)) 
+
+plot(surface_left, left_data, palette = c("#67a9cf", "#ef8a62")
+   , colour_range = c(0,1)
+   , colour_bar = FALSE)
+
+rgl::par3d(userMatrix = lrot)
+rgl::snapshot3d("ppr-figures/2019-06-28_left-curv-concordance.png")
+
+rrot <-
+  structure(c(-0.224419295787811, -0.0547835230827332, 0.972918272018433,  0
+            , 0.904397368431091, 0.360011339187622, 0.228888094425201, 0
+            , -0.362816751003265, 0.931277096271515, -0.0312428772449493, 0
+            , 0, 0, 0, 1), .Dim = c(4L, 4L)) 
+
+
+plot(surface_right, right_data, palette = c("#67a9cf", "#ef8a62")
+   , discreteStats = TRUE
+   , colour_bar = FALSE)
+
+rgl::par3d(userMatrix = rrot)
+rgl::snapshot3d("ppr-figures/2019-06-28_right-curv-concordance.png")
+```
+
+and similarity
+
+```{r}
+sim_data <-
+  mean_tAll_res %>%
+  mutate(fquantile = ecdf(abs(fconc))(abs(fconc))
+       , mquantile = ecdf(abs(`beta-Dx`))(abs(`beta-Dx`))
+       , quantile_mask = fquantile > .7 | mquantile > .7
+         )
+
+mean_masked_ss <-
+  sim_data %>%
+  filter(quantile_mask) %>%
+  summarize(mean_fc = mean(fconc)
+          , sd_fc = sd(fconc)
+          , mean_mc = mean(`beta-Dx`)
+          , sd_mc = sd(`beta-Dx`)
+          , nfc = list((fconc - mean_fc) / sd_fc)
+          , nmc = list((`beta-Dx` - mean_mc) / sd_mc)
+          , msq = mean((nmc[[1]] - nfc[[1]])^2))
+
+sim_data_ss <-
+  sim_data %>%
+  mutate(nfc = (fconc - mean_masked_ss$mean_fc) / mean_masked_ss$sd_fc
+       , nmc = (`beta-Dx` - mean_masked_ss$mean_mc) / mean_masked_ss$sd_mc
+       , ss = (nfc - nmc)^2 / mean_masked_ss$msq
+       , masked_ss = ifelse(quantile_mask, ss, NA))
+```
+
+And now the plots
+
+```{r}
+left_data_sim <- rep(NA, length(aal_left_mask))
+left_data_sim[aal_left_mask] <-
+  sim_data_ss$masked_ss %>%
+  { .[rep(c(FALSE,TRUE), each = length(.)/2)] }
+
+left_data_sim[is.na(left_data_sim) | aal21_left_mask] <- NA
+
+slrot <-
+  structure(c(0.178329914808273, 0.0342339426279068, -0.983372807502747, 
+              0, -0.79033750295639, 0.600311517715454, -0.12242541462183, 0, 
+              0.586140334606171, 0.79902982711792, 0.134110182523727, 0, 0, 
+              0, 0, 1), .Dim = c(4L, 4L))
+
+plot(surface_left, left_data_sim
+   , colour_range =
+       c(0
+       , round(max(sim_data_ss$masked_ss, na.rm = TRUE), 3)))
+
+rgl::par3d(userMatrix = slrot)
+rgl::snapshot3d("ppr-figures/2019-06-28_left-curv-sim.png")
+
+slrot_med <-
+  structure(c(-0.125822141766548, 0.33337140083313, 0.934351623058319, 
+              0, 0.883470833301544, 0.46606770157814, -0.047320120036602, 0, 
+              -0.451252192258835, 0.819518744945526, -0.353166908025742, 0, 
+              0, 0, 0, 1), .Dim = c(4L, 4L))
+
+rgl::par3d(userMatrix = slrot_med)
+rgl::snapshot3d("ppr-figures/2019-06-28_left-curv-med-sim.png")
+
+right_data_sim <- rep(NA, length(aal_right_mask))
+right_data_sim[aal_right_mask] <-
+  sim_data_ss$masked_ss %>%
+  { .[rep(c(TRUE, FALSE), each = length(.)/2)] }
+
+right_data_sim[is.na(right_data_sim) | aal21_right_mask] <- NA
+
+srrot <-
+  structure(c(-0.245693057775497, -0.00968122482299805, 0.969284474849701, 
+              0, 0.711820065975189, 0.676935374736786, 0.187193542718887, 0, 
+              -0.657963573932648, 0.735953450202942, -0.159423530101776, 0, 
+              0, 0, 0, 1), .Dim = c(4L, 4L))
+
+plot(surface_right, right_data_sim
+   , colour_range =
+       c(0
+       , round(max(sim_data_ss$masked_ss, na.rm = TRUE), 3)))
+
+rgl::par3d(userMatrix = srrot)
+rgl::snapshot3d("ppr-figures/2019-06-28_right-curv-sim.png")
+
+srrot_med <-
+  structure(c(-0.129484370350838, -0.199263498187065, -0.971329987049103, 
+              0, -0.746186137199402, 0.664674043655396, -0.0368823558092117, 
+              0, 0.652985394001007, 0.720022618770599, -0.234759896993637, 
+              0, 0, 0, 0, 1), .Dim = c(4L, 4L))
+
+rgl::par3d(userMatrix = srrot_med)
+rgl::snapshot3d("ppr-figures/2019-06-28_right-curv-med-sim.png")
+
+overall_sim <-
+  cor(right_data_sim %>% { .[!is.na(.) & !is.na(left_data_sim)] }
+    , left_data_sim %>% { .[!is.na(.) & !is.na(right_data_sim)] })
+
+
+obj_montage(surface_left, surface_right
+          , left_data_sim, right_data_sim
+          , colour_title = "Normalized squared deviation"
+          , zoom = .8
+          , layout = function() rgl::layout3d(matrix(1:6, nrow = 1))
+          , colour_range =
+                c(.92 # chosen to include the top 20% of deviations.
+                , max(c(left_data_sim, right_data_sim), na.rm = TRUE) %>%
+                  `*`(100) %>%
+                  floor %>%
+                  `/`(100)
+                  )
+          , plot_corners = c(1,1, 1600,640)
+          , par =
+                list(cex = 2, lpos = .1, rpos = .8, tpos = .20, bpos = .24
+                   , srt = 0
+                   , nudge_title_y = .3
+                   , nudge_title_x = -.5
+                   , offset = 1.5
+                   , pos = 1
+                     )
+          , vertical = FALSE
+            )
+
+rgl::useSubscene3d(rgl::subsceneList()[2])
+rgl::par3d("userMatrix" = set(rgl::par3d("userMatrix"), slab_l(1,4), 10))
+
+rgl::useSubscene3d(rgl::subsceneList()[3])
+rgl::par3d("userMatrix" = set(rgl::par3d("userMatrix"), slab_l(1,4), 20))
+rgl::par3d(zoom = .75)
+
+rgl::useSubscene3d(rgl::subsceneList()[4])
+rgl::par3d("userMatrix" = set(rgl::par3d("userMatrix"), slab_l(1,4), -20))
+rgl::par3d(zoom = .75)
+
+rgl::useSubscene3d(rgl::subsceneList()[5])
+rgl::par3d("userMatrix" = set(rgl::par3d("userMatrix"), slab_l(1,4), -15))
+rgl::par3d(zoom = .75)
+
+rgl::useSubscene3d(rgl::subsceneList()[6])
+rgl::par3d(zoom = .75)
+
+rgl::snapshot3d("ppr-figures/2019-06-28_similarity-montage.png")
+
+pdf("ppr-figures/2019-06-28_measure-similarity-with-cortex.pdf", height = 6, width = 9)
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(2,1, height = c(3,1))))
+pushViewport(viewport(layout.pos.row = 1))
+map(vsd_ppr, plot_vertex_similarity_measure, ylim = c(vsd_ppr_min, vsd_ppr_max)) %>%
+    map(~ set(., c_l("facet", "params", "labeller")
+            , labeller(group = function(value){ sub(", All Subjects", "", value) }))) %>%
+    { set(plot_all_measures, body_l %.% c_l(2), NULL)(.) }
+popViewport()
+popViewport()
+popViewport()
+pushViewport(viewport(layout.pos.row = 2))
+image_read("ppr-figures/2019-06-28_similarity-montage.png") %>%
+  image_crop("1599x400+0+100") %>%
+  image_crop("1599x400+0-100") %>%
+  grid.raster()
+dev.off()
+```
+
+First we need to generate the results
+
+```{r}
+subcort_env <- new.env()
+
+evalq({
+  load("../subcortical/model_selection_assets.rda")
+  load("../subcortical/model_selection_results.rda")
+}, subcort_env)
+
+sc_best <- subcort_env$best_models
+sc_exp <- subcort_env$experiment_frame
+
+sc_filt <-
+  sc_exp %>%
+  ungroup %>%
+  filter(!grepl("<", split)) 
+
+sc_model_frame <-
+  inner_join(ungroup(sc_best), sc_filt %>% select(-set)
+           , by = c("match_iq", "split")) %>%
+  mutate(job = 1:n()) %>%
+  filter(set_number == 2
+       , match_iq
+       , split == "TRUE"
+       , measures == "volume")
+
+volume_mod <-
+  anatLmer(as.formula(sc_model_frame$model_string[[1]])
+         , data = subcort_env$imputed_sets[[1]]
+         , anat = t(subcort_env$measures[[1]]))
+```
+
+
+And munge them
+
+```{r}
+volume_frame <-
+  volume_mod %>%
+  as.data.frame %>%
+  (tibble::rownames_to_column)(var = "Structure") %>%
+  filter(Structure != "ITV") %>%                           
+  mutate(fconc = `beta-Dx` + `beta-sex2:Dx`)
+
+## vol_max_t <-
+##   volume_frame %>%
+##   summarize(fconc_max = max(abs(fconc))
+##           , mconc_max = max(abs(`beta-Dx`))) %>%
+##   unlist %>%
+##   max
+
+vsim <-
+  volume_frame %>%
+  mutate(fquantile = ecdf(abs(fconc))(abs(fconc))
+       , mquantile = ecdf(abs(`beta-Dx`))(abs(`beta-Dx`))
+       , quantile_mask = fquantile > .7 | mquantile > .7
+         )
+
+vsim_masked_ss <-
+  vsim %>%
+  filter(quantile_mask) %>%
+  summarize(mean_fc = mean(fconc)
+          , sd_fc = sd(fconc)
+          , mean_mc = mean(`beta-Dx`)
+          , sd_mc = sd(`beta-Dx`)
+          , nfc = list((fconc - mean_fc) / sd_fc)
+          , nmc = list((`beta-Dx` - mean_mc) / sd_mc)
+          , msq = mean((nmc[[1]] - nfc[[1]])^2))
+
+vsim_ss <-
+  vsim %>%
+  mutate(nfc = (fconc - vsim_masked_ss$mean_fc) / vsim_masked_ss$sd_fc
+       , nmc = (`beta-Dx` - vsim_masked_ss$mean_mc) / vsim_masked_ss$sd_mc
+       , ss = (nfc - nmc)^2 / vsim_masked_ss$msq
+       , masked_ss = ifelse(quantile_mask, ss, NA))
+```
+
+Now to plot
+
+```{r}
+merged_atlas <- mincGetVolume("../data/subcortical_atlas_merged.mnc")
+
+merged_labels <- read.csv("../data/subcortical_atlas_RMINC.csv")
+
+fast_remap <- function(old, new, vol){
+  old <- round(old)
+  vol <- round(vol)
+  old_na <- is.na(old)
+  
+  if(0 %in% old){
+    old <- old + 1
+    vol <- vol + 1
+  }
+  lookup <- numeric(max(old[!old_na]) + 1)
+  lookup[old[!old_na]+1] <- new[!old_na]
+ 
+  vol_new <- lookup[vol + 1]
+  attributes(vol_new) <- attributes(vol)
+
+  vol_new
+}
+
+merged_labels_munged <-
+  merged_labels %>%
+  gather(side, label, left.label:right.label) %>%
+  mutate(side = sub("\\..*$", "", side)
+       , Structure =
+           gsub("[ [:punct:]]+", "_", Structure) %>% 
+           paste0(side, "_", .))
+
+subcortical_stats <-
+  vsim_ss %>%
+  mutate(Structure =
+           gsub("[ [:punct:]]+", "_", Structure) %>%
+           { ifelse(grepl("^[rl]", .)
+                  , .
+                  , paste0("right_", .)) }
+         ) %>%
+  left_join(merged_labels_munged, by = "Structure")
+```
+
+And plot
+e
+```{r}
+vals <- subcortical_stats$masked_ss
+inds <- subcortical_stats$label
+
+new_vals <- fast_remap(inds, vals, merged_atlas)
+  
+ss_range <- range(vals, na.rm = TRUE)
+ss_range[1] <- .92
+ss_range[2] <- ceiling(ss_range[2] * 100)/100
+
+png("similarity_subcortical.png", width = 1800, height = 750)
+mincPlotSliceSeries(
+  mincArray(mincGetVolume("../data/mni_icbm152_t1_tal_nlin_sym_09c.mnc"))
+, mincArray(new_vals)
+, low = ss_range[1]
+, high = ss_range[2]
+, dimension = 2
+, mfrow = c(2, 10)
+, legend = "Normalized Squared Deviation"
+, plottitle = "Subcortical Similarity"
+, begin = 35, end = -40
+, anatLow = 15, anatHigh = 100
+, anatCol = gray.colors(255, start = 0, gamma = 1)
+)
+
+dev.off()
+```
+
+
+Now for the volume plot with the slice figure
+
+```{r}
+library(MRIcrotome)
+
+icbm <- mincArray(mincGetVolume("../data/mni_icbm152_t1_tal_nlin_sym_09c.mnc"))
+
+slice_series <-
+  sliceSeries(nrow = 2, ncol = 5, slices = c(50,60,70,80,90, 110,120,130,140,150), dimension = 2) %>%
+  anatomy(volume = icbm
+        , low = 15, high = 100) %>%
+  overlay(volume = mincArray(new_vals), low = ss_range[1], high = ss_range[2]) %>%
+  legend(description = "Normalized Squared Deviation") %>%
+  contourSliceIndicator(volume = icbm, dimension = 1, c(30, 100)) %>%
+  addtitle("Similarity by region")
+
+sccd_filt <-
+  (plot_vertex_concordance_measure(
+    generate_vertex_concordance_data(vol_res, "Volume") %>%
+    with(list(vert_conc = filter(vert_conc, group %in% ppr_groups)
+            , vert_conc_bounds = filter(vert_conc_bounds, group %in% ppr_groups)
+            , measure = .$measure)) 
+  ) +
+  ggtitle("Sign Concordance") +
+  facet_wrap(~ group, ncol = 1)) %>%
+  set(., c_l("facet", "params", "labeller")
+           , labeller(group = function(value){ sub(", All Subjects", "", value) }))
+
+scsd_filt <-
+  (plot_vertex_similarity_measure(
+    generate_vertex_similarity_data(vol_res, "Volume") %>%
+    with(list(vert_conc = filter(vert_conc, group %in% ppr_groups)
+            , vert_conc_bounds = filter(vert_conc_bounds, group %in% ppr_groups)
+            , measure = .$measure)) 
+  ) +
+  ggtitle("Spatial Similarity") +
+  facet_wrap(~ group, ncol = 1)) %>%
+  set(., c_l("facet", "params", "labeller")
+           , labeller(group = function(value){ sub(", All Subjects", "", value) }))
+
+sccd_filt_supp <-
+  plot_vertex_concordance_measure(
+    generate_vertex_concordance_data(vol_res, "Volume") %>%
+    with(list(vert_conc = filter(vert_conc, !group %in% ppr_groups)
+            , vert_conc_bounds = filter(vert_conc_bounds, !group %in% ppr_groups)
+            , measure = .$measure)) 
+  ) +
+  ggtitle("Sign Concordance") +
+  facet_wrap(~ group, ncol = 1)
+
+scsd_filt_supp <-
+  plot_vertex_similarity_measure(
+    generate_vertex_similarity_data(vol_res, "Volume") %>%
+    with(list(vert_conc = filter(vert_conc, !group %in% ppr_groups)
+            , vert_conc_bounds = filter(vert_conc_bounds, !group %in% ppr_groups)
+            , measure = .$measure)) 
+  ) +
+  ggtitle("Spatial Similarity") +
+  facet_wrap(~ group, ncol = 1)
+
+pdf("ppr-figures/2019-06-28_volume-plots-filtered.pdf", height = 8, width = 14)
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(2,1)))
+pushViewport(viewport(layout = grid.layout(1,2), layout.pos.row = 1))
+
+pushViewport(viewport(layout.pos.col = 1))
+grid.draw(ggplotGrob(sccd_filt))
+popViewport()
+
+pushViewport(viewport(layout.pos.col = 2))
+grid.draw(ggplotGrob(scsd_filt))
+popViewport()
+popViewport()
+
+pushViewport(viewport(layout.pos.row = 2))
+grid.lines(y = 1)
+grid.draw(grobify(slice_series))
+
+dev.off()
+
+pdf("ppr-figures/2019-06-28_volume-plots-filtered-supplemental.pdf", height = 4, width = 14)
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(1,2)))
+
+pushViewport(viewport(layout.pos.col = 1))
+grid.draw(ggplotGrob(sccd_filt_supp))
+popViewport()
+
+pushViewport(viewport(layout.pos.col = 2))
+grid.draw(ggplotGrob(scsd_filt_supp))
+popViewport()
+
+dev.off()
+#####
+```
+
+Let's make a table of the best models. We need to tack on the volume models
+
+```{r}
+all_best_models <-
+  sc_best %>%
+  ungroup %>%
+  mutate(measures = "subcortical_volume") %>%
+  bind_rows(best_models, .) %>%
+  filter(!grepl("<", split)) %>%
+  arrange(measures) %>%
+  mutate(split = case_when(split == "TRUE" ~ "All"
+                         , split == "x > 100" ~ "IQ > 100"
+                         , split == "x > 85" ~ "IQ > 85"))
+
+write.csv(all_best_models, "all-best-models.csv")
+```

@@ -1,0 +1,332 @@
+---
+title: vertexwise_results
+author: Chris Hammill
+date: March 05, 2018
+output: html_document
+---
+
+Now I want to look at the results of these analyses. 
+
+First I need some new functions, combining imputations is relatively simple
+but I will need to deconstruct the lmer objects in order to get p-values.
+So let's start by loading in the data and then presenting the necessary functions
+
+## Load up
+
+Load in required packages
+
+```{r}
+knitr::opts_chunk$set(cache.lazy = FALSE)
+suppressPackageStartupMessages({
+    library(autismSexDifferences)
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(mice)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+})
+```
+
+## Data ingest
+
+First let's load in the needed assets 
+
+```{r pull_data, cache = TRUE}
+load("../cortical_objects_longi20180115.rda")
+load("model_selection_assets.rda")
+load("model_selection_results.rda")
+reg <- loadRegistry("./vertexwise_analyses/")
+```
+
+## Functions
+
+```{r functions, cache = TRUE, dependson = "pull_data"}
+get_se <- function(model, eff_name){
+  model %>%
+    { .[, paste0("beta-", eff_name)] /
+        .[,paste0("tvalue-", eff_name)] }
+}
+
+process_lmer <- function(model, effects = c("sex2", "sex2:Dx")){
+  n <- nrow( attributes(model)$data )
+  lapply(effects
+       , function(eff){
+         cbind(model[, paste0("beta-", eff)]
+             , (get_se(model, eff) * sqrt(n))^2 ) %>%
+         `colnames<-`(paste0(c("beta-", "v-"), eff))
+         }) %>%
+    Reduce(cbind, .) %>%
+    `attr<-`("n", n) 
+}
+
+merge_lmers <- function(processed_mods){
+  n <- length(processed_mods)
+  m <- ncol(processed_mods[[1]])
+  nms <- colnames(processed_mods[[1]])
+  
+  means <- 
+    Reduce(
+      function(acc, pm){
+        pm/n + acc
+      }, processed_mods, 0)
+  
+  vars <-
+    Reduce(
+      function(acc, pm){
+        (pm - means)^2 + acc
+      }, processed_mods, 0
+    ) / (n - 1)
+
+  res <- cbind(means, vars)
+  attr(res, "n") <- attr(processed_mods[[1]], "n")
+
+  colnames(res) <- c(nms, paste0("mv-", nms))
+  res
+}
+
+process_merged_lmers <- function(merged_lmer, m = 5){
+  nm <- colnames(merged_lmer)
+  effs <-
+    grep("^beta-", nm, value = TRUE) %>%
+    sub("^beta-", "", .)
+
+  betas <- paste0("beta-", effs)
+  vs <- paste0("v-", effs)
+  mv_betas <- paste0("mv-beta-", effs)
+
+  eff_betas <- merged_lmer[,betas, drop = FALSE]
+  eff_sds <- sqrt(merged_lmer[,vs, drop = FALSE] +
+                  (1 + 1/m) * merged_lmer[,mv_betas, drop = FALSE]^2)
+  eff_se <- eff_sds / sqrt(attr(merged_lmer, "n"))
+
+  res <- cbind(eff_betas, eff_betas / eff_se)
+  colnames(res) <- c(betas, paste0("tvalue-", effs))
+
+  res
+}
+
+process_and_replace <- function(models, effects = NULL, debug = FALSE){
+  n <- length(models)
+  if(debug && (! n %in% c(1,5)))
+    stop("Strange group size detected")
+
+  if(n == 1)
+    return(models)
+
+  if(is.null(effects))
+    effects <-
+      colnames(models[[1]]) %>%
+      grep("^beta-", ., value = TRUE) %>%
+      sub("beta-", "", .)
+  
+  pooled_stats <- 
+    map(models, process_lmer, effects = effects) %>%
+    merge_lmers() %>%
+    process_merged_lmers(m = n)
+
+  fixed_model <- models[[1]]
+  fixed_model[, colnames(pooled_stats)] <- pooled_stats
+
+  fixed_model
+}
+
+## Test that my pooling yeilds equivalent results, and yes they do!
+
+## response <- rnorm(1045)
+## lmod <- map(useful_sets$matched_set
+##           , ~ anatLm(~ sex + Dx + sex:Dx, data = ., anat = matrix(response)))
+## lms <- as.mira(map(useful_sets$matched_set, ~ lm(response ~ sex + Dx + sex:Dx, data = .)))
+## lmod %>%
+##   map(function(l){
+##     attributes(l)$mincLmerList[[1]$fr <- useful_sets$matched_set[[1]]
+##     l
+##   }) %>%
+##   map(process_lmer) %>%
+##   merge_lmers %>%
+##   process_merged_lmers
+
+## summary(pool(lms))
+```
+
+## Construct experiment frame
+
+Equivalent to the same code from `run_spatial_analysis`
+
+```{r generate_experiment_frame, cache = TRUE, dependson = "functions"}
+experiment_frame_filtered <-
+  experiment_frame %>%
+  ungroup %>%
+  filter(!grepl("<", split))
+
+model_frame <-
+  inner_join(ungroup(best_models), experiment_frame_filtered %>% select(-set)
+           , by = c("match_iq", "split")) %>%
+  mutate(job = 1:n())
+
+if(nrow(model_frame) != 64)
+  stop("merging went wrong")
+```
+
+now I need to get a group of them to test on
+
+```{r test_processing, cache = TRUE, eval = FALSE}
+test_group <- 
+  model_frame %>%
+  filter(!(!match_iq | split == "TRUE")) %>%
+  group_by(match_iq, split, measures) %>%
+  nest %>%
+  slice(1) %>%
+  unnest
+
+#test_res <- reduceResultsList(test_group$job, reg = reg)
+```
+
+## Figure code
+
+```{r figure_code, cache = TRUE}
+show_effect <-
+  function(model, column, range, file){
+    right_vals <- model[rep(c(TRUE,FALSE), each = nrow(model)/2),column]
+    left_vals <- model[rep(c(FALSE, TRUE), each = nrow(model)/2),column]
+
+    left_coefs <- rep(0, length(aal_left_mask))
+    left_coefs[aal_left_mask] <- left_vals
+
+    right_coefs <- rep(0, length(aal_right_mask))
+    right_coefs[aal_right_mask] <- right_vals
+
+
+    obj_montage(surface_left, surface_right, left_coefs, right_coefs
+              , colour_range = range
+              , symmetric = TRUE
+              , output = file)
+  }
+```
+
+## Process models
+
+```{r get_models, cache = TRUE, dependson = "generate_experiment_frame"}
+grouped_models <-
+  model_frame %>%
+  group_by(match_iq, split, measures)
+
+ngroups <- n_groups(grouped_models)
+
+process_group <- function(grp){
+  print(grp$job)
+  res <- reduceResultsList(grp$job
+                         , function(m){
+                           attributes(m)[c("anat"
+                                         , "mincLmerList")] <-  NULL
+                           gc()
+                           m
+                         }
+                       , reg = reg)
+  if(length(res) > 1){
+    res <- process_and_replace(res, c("sex2", "sex2:Dx", "Dx"))
+  } else {
+    res <- res[[1]]
+  }
+
+  res <- res[, sapply(c("sex2", "sex2:Dx", "Dx"),
+                      function(s)
+                        paste0(c("beta-", "tvalue-"), s))
+             ]
+
+  attributes(res)$anat <- NULL
+
+  return(res)
+}
+
+results <-
+  grouped_models %>%
+  do(res = process_group(.))
+```
+
+## FDR
+
+Now that we have the results, we're going to go through and do
+FDR correction on the diagnosis, sex, and interaction effects.
+For this I'm going to use 
+
+```{r get_thresh, cache = TRUE, dependson = "get_models"}
+results_with_thresh <-
+  results %>%
+  ungroup %>%
+  mutate(res = map(res, function(r){
+    cols <- grep("tvalue-", colnames(r), value = TRUE)
+    effs <- sub("tvalue-", "", cols)
+    ts <- r[,cols]
+    qs <- apply(ts, 2, function(x) fdrtool::fdrtool(x, plot = FALSE)$qval)
+    new_res <- cbind(r, qs)
+    colnames(new_res) <- c(colnames(r), paste0("qvalue-", effs))
+    new_res
+  })
+, cutoffs = map(res, function(r){
+  qnames <- grep("qvalue-", colnames(r), value = TRUE)
+  eff <- sub("qvalue-", "", qnames)
+  thresholds <- 
+    sapply(eff, function(n){
+      ts <- r[, paste0("tvalue-", n)]
+      qs <- r[, paste0("qvalue-", n)]
+      min(abs(ts)[qs < .10])
+    })
+    
+  as.list(thresholds) %>%
+    setNames(paste0("thresh-", qnames)) %>%
+    as_data_frame
+})) %>%
+unnest(cutoffs)
+```
+
+## Snapshots
+
+Now we're going to take some snapshots, first let's create a directory if it doesn't
+exist yet. The walk the results and snapshot
+
+```{r generate_snaps, cache = TRUE, dependson = "get_thresh"}
+if(!file.exists("vertexwise_snaps"))
+  dir.create("vertexwise_snaps")
+
+results_with_thresh %>%
+  pwalk(function(measures, match_iq, split, res, ...){
+    .dots <- list(...)
+    filename <- paste(`if`(match_iq, "match", "nomatch")
+                    , case_when(split == "TRUE" ~ "iq-all"
+                              , split == "x > 100" ~ "iq-gt100"
+                              , split == "x > 85" ~ "iq-gt85")
+                    , measures
+                    , sep = "_")
+    
+    effs <- c("Dx", "sex2", "sex2:Dx")
+    walk(effs, function(eff){
+      tval <- res[, paste0("tvalue-", eff)]
+      thresh <- getElement(.dots, paste0("thresh-qvalue-", eff))
+      if(!is.finite(thresh)) thresh <- 0
+      show_effect(res, paste0("tvalue-", eff), range = c(thresh, 5)
+                , file = file.path("vertexwise_snaps"
+                                 , paste0(filename, "_tvalue-"
+                                        , sub(":", "-", eff)
+                                        , ".png")))
+    })
+  })
+```
+
+## Output data
+
+output the thresholds
+
+```{r output_thresholds, cache = TRUE, dependson = "get_thresh"}
+results_with_thresh %>%
+  select(-res) %>%
+  write.csv(paste0(Sys.Date(), "_vertexwise-fdr-thresholds.csv"), row.names = FALSE)
+```
+
+output the pooled data
+
+```{r output_pooled_res, cache = TRUE, dependson = "get_thresh"}
+results_with_thresh %>%
+  saveRDS(paste0(Sys.Date(), "_pooled-vertexwise-res.rds"))
+```

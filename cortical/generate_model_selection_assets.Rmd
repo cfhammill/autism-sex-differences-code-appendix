@@ -1,0 +1,235 @@
+---
+title: generate_model_selection_assets
+author: Chris Hammill
+date: December 21, 2017
+output: html_document
+---
+
+## Load up
+
+Load in required packages
+
+```{r}
+knitr::opts_chunk$set(cache.lazy = FALSE)
+suppressPackageStartupMessages({
+    library(autismSexDifferences)
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(mice)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+})
+```
+
+
+## Data ingest
+
+Pull in data
+
+```{r pull_data, cache = TRUE}
+load("../cortical_objects_longi20171221.rda")
+```
+
+## Setup Models
+
+First we'll set up the model sets for model selection.
+
+We'll make the two model formula sets, with and without iq
+
+```{r model_form, cache = TRUE}
+model_forms <-
+    c(nint = ~ iq + sex + Dx + bv + age_scan + Dx:sex + new_scanner + (1 | subject)
+    , nint_crb = ~ iq + sex + Dx + crbv + age_scan + Dx:sex + new_scanner + (1 | subject)
+    , nint_ttrb = ~ iq + sex + Dx + ttrbv + age_scan + Dx:sex + new_scanner + (1 | subject)
+    , pnint = ~ iq + sex + Dx + bv + poly(age_scan,2) + Dx:sex + new_scanner + (1 | subject)
+    , pnint_crb = ~ iq + sex + Dx + crbv + poly(age_scan,2) + Dx:sex + new_scanner + (1 | subject)
+    , pnint_ttrb = ~ iq + sex + Dx + ttrbv + poly(age_scan,2) + Dx:sex + new_scanner + (1 | subject)
+    , nex = ~ iq + sex + Dx + bv + age_scan + Dx:sex + age_scan:sex + new_scanner + (1 | subject)
+    , nex_crb = ~ iq + sex + Dx + crbv + age_scan + Dx:sex + age_scan:sex + new_scanner + (1 | subject)
+    , nex_ttrb = ~ iq + sex + Dx + ttrbv + age_scan + Dx:sex + age_scan:sex + new_scanner + (1 | subject)
+    , nage = ~ iq + sex + Dx + bv + age_scan + Dx:sex + bv:sex + new_scanner + (1 | subject)
+    , nage_crb = ~ iq + sex + Dx + crbv + age_scan + Dx:sex + crbv:sex + new_scanner + (1 | subject)
+    , nage_ttrb = ~ iq + sex + Dx + ttrbv + age_scan + Dx:sex + ttrbv:sex + new_scanner + (1 | subject)
+    , st = ~ iq + sex + Dx + bv + age_scan + Dx:sex + bv:sex + age_scan:sex + new_scanner + (1 | subject)
+    , crb = ~ iq + sex + Dx + crbv + age_scan + Dx:sex + crbv:sex + age_scan:sex + new_scanner + (1 | subject)
+    , ttrb = ~ iq + sex + Dx + ttrbv + age_scan + Dx:sex + ttrbv:sex + age_scan:sex + new_scanner + (1 | subject)
+    , page = ~ iq + sex + Dx + bv + poly(age_scan,2) + Dx:sex + bv:sex + poly(age_scan,2):sex + new_scanner + (1 | subject)
+    , page_crb = ~ iq + sex + Dx + crbv + poly(age_scan,2) + Dx:sex + crbv:sex + poly(age_scan,2):sex + new_scanner + (1 | subject)
+    , page_ttrb = ~ iq + sex + Dx + ttrbv + poly(age_scan,2) + Dx:sex + ttrbv:sex + poly(age_scan,2):sex + new_scanner + (1 | subject))
+
+model_forms_noiq <- lapply(model_forms, function(m) update(m,  ~ . - iq))
+
+models_set <-
+  list(iq = model_forms
+     , noiq = model_forms_noiq)
+```
+
+## Generate Full Experiment
+
+For the mixed effects version, I'm going to follow the same expansion as the non mixed effects version
+but winnow the pool down to:
+
+1. All: both matched and modelled    (5)
+2. All: neither matched nor modelled (1)
+3. LT85: neither                     (1)
+4. LT100: neither                    (1)
+5. GT85: both                        (5)
+6. GT100: both                       (5)
+
+For a total of 18 experiments, 4 measures each. With 36 models to select from, 1000 randomizations,
+and 1 final model. Each taking approximately half an hour to fit is going to need 37000 hours of
+single core compute.
+
+## Imputation
+
+First we need to impute iq (for the analyses that match or model IQ)
+
+```{r imputation, cache = TRUE, dependson = "pull_data"}
+imputed_sets <-
+    model_data %>%
+    select(age_scan, bv, sex, Dx, iq) %>%
+    mice %>%
+    mids_to_dfs %>%
+    lapply(mutate
+         , subject = model_data$subject
+         , new_scanner = model_data$new_scanner
+         , crbv = model_data$crbv
+         , ttrbv = model_data$ttrbv
+         , Dx = as.numeric(factor(Dx, c("CTRL", "ASD"))) - 1)
+
+```
+
+## Generate IQ Partitions
+
+Now I need to generate the splits needed for the subgrouping
+
+```{r iq_groups, dependson = "imputation"}
+iq_scale <- sd(civet_deduped$iq, na.rm = TRUE)
+iq_center <- mean(civet_deduped$iq, na.rm = TRUE)
+
+imputed_sets <-
+  imputed_sets %>%
+  lapply(function(f){
+    mutate(f
+         , iq_native = iq * iq_scale + iq_center)
+  })     
+```
+
+## Matching
+
+Now that we have the imputed sets we can perform the matching.
+
+```{r dist_calc, cache = TRUE, dependson = "imputation"}
+
+experiment_frame <-
+  crossing(match_iq = c(TRUE, FALSE)
+         , data_frame(set = imputed_sets
+                    , set_number = seq_along(imputed_sets))
+         , data_frame(pred =
+                        list(function(x) TRUE
+                           , function(x) x <= 85
+                           , function(x) x > 85
+                           , function(x) x <= 100
+                           , function(x) x > 100
+                             )
+                      )) %>% 
+  mutate(w_iq = ifelse(match_iq, 1/4, 0)
+       , w_bv = 1/2
+       , split = sapply(pred, function(x) deparse(body(x)))
+       , experiment = paste0("match", match_iq, "_", set_number, "_", split)) %>%
+  filter((split == "TRUE") 
+       | (split == "x <= 85"  & !match_iq) 
+       | (split == "x <= 100" & !match_iq) 
+       | (split == "x > 85"   &  match_iq) 
+       | (split == "x > 100"  &  match_iq)) %>%
+  filter(match_iq | set_number == 1)
+
+subject_distances <-
+  experiment_frame %>%
+  pmap(function(set,w_iq,w_bv, pred, ...)
+    create_dist_mat(data = filter(set, pred(iq_native) | Dx == 0)
+                  , w_iq = w_iq, w_bv = w_bv)) %>%
+  data_frame(distances = ., experiment = experiment_frame$experiment)
+
+```
+
+Now to do the actual matching
+
+```{r matching, cache = TRUE, dependson = "dist_calc"}
+matched_sets <-
+  experiment_frame %>%
+  pmap(function(set, pred, experiment, ...){
+    exp <- experiment
+    distance <-
+      subject_distances %>%
+      filter(experiment == exp) %>%
+      .$distances %>%
+      first
+
+    full_match(filter(set, pred(iq_native) | Dx == 0)
+             , distance)
+    })
+
+sets_frame <-
+  mutate(experiment_frame
+       , matched_set = matched_sets)
+```
+
+## Add outcome measures
+
+Now cross the experiment frame with the matches
+
+```{r add_outcomes, cache = TRUE, dependson = "matching"}
+measures <-
+  list(thickness = thickness
+     , area = area
+     , volume = volume
+     , mean_curv = mean_curv)
+
+measures_frame <- 
+  crossing(experiment = experiment_frame$experiment
+         , measures = c("thickness", "area", "volume", "mean_curv"))
+```
+
+## Model Selection Experiment
+
+Make a test grid for model selection
+
+```{r model_selection_grid, cache = TRUE, dependson = c("add_outcomes", "model_form")}
+model_selection_frame <-
+  experiment_frame %>%
+  select(-set) %>%
+  inner_join(measures_frame, by = "experiment")
+
+## This line differs in that there is no matched not modelled or vice-versa
+## So I only need the two combinations
+models_frame <- 
+  data_frame(model_iq = c(TRUE, FALSE)
+           , match_iq = c(TRUE, FALSE) 
+           , model = models_set) %>%
+rowwise() %>%
+  do({
+    as_data_frame(.) ## this expands out the 18 models
+  })
+
+model_selection_frame <-  
+  inner_join(model_selection_frame, models_frame, by = "match_iq") 
+```
+
+## Write Out Model Selection Assets
+
+Now write out all of these objects to be read in by the
+next portion of the analysis
+
+```{r output, cache = TRUE, dependson = "model_selection_grid"}
+save(measures_frame = measures_frame
+   ,  measures = measures
+   , model_selection_frame = model_selection_frame
+   , sets_frame = sets_frame
+   , experiment_frame = experiment_frame
+   , imputed_sets = imputed_sets
+   , file = "model_selection_assets.rda"
+     )
+```

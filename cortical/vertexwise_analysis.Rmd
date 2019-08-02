@@ -1,0 +1,165 @@
+---
+title: vertexwise_analysis
+author: Chris Hammill
+date: March 01, 2018
+output: html_document
+---
+
+With all the randomization tests run, it now seems worthwhile to run
+the original models and analyze them indepently.
+
+## Load up
+
+Load in required packages
+
+```{r}
+knitr::opts_chunk$set(cache.lazy = FALSE)
+suppressPackageStartupMessages({
+    library(autismSexDifferences)
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(mice)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+})
+```
+
+## Data ingest
+
+First let's load in the needed assets 
+
+```{r pull_data, cache = TRUE}
+load("../cortical_objects_longi20180115.rda")
+load("model_selection_assets.rda")
+load("model_selection_results.rda")
+```
+
+## Set up the randomization
+
+Equivalent to the same code from `run_spatial_analysis`
+
+```{r generate_experiment_frame, cache = TRUE}
+experiment_frame_filtered <-
+  experiment_frame %>% filter(!grepl("<", split))
+
+model_frame <-
+  inner_join(best_models, experiment_frame_filtered %>% select(-set)
+           , by = c("match_iq", "split"))
+
+if(nrow(model_frame) != 64)
+  stop("merging went wrong")
+```
+
+create the data fetch and model fit functions
+
+```{r setup_functions, cache = TRUE}
+get_data <- function(match_iq, set_number, split, measurement){
+
+  ## Rename for use in filter
+  iq <- match_iq
+  sn <- set_number
+  sp <- split
+  
+  data <-
+    sets_frame %>%
+    filter(match_iq == iq
+         , set_number == sn
+         , split == sp)
+
+  if(nrow(data) != 1)
+    stop("something is wrong with your sets frame")
+
+  full_set <- data$set[[1]]
+  matched_set <- data$matched_set[[1]]
+  pred <- data$pred[[1]]
+  
+  filter_vec <- pred(full_set$iq_native) | full_set$Dx == 0
+  anat <- measures[[measurement]][,filter_vec]
+
+  if(ncol(anat) != nrow(matched_set))
+    stop("The filtration didn't work")
+
+  list(data = matched_set
+     , anat = anat
+     , filter_vec = filter_vec)
+}
+
+fit_model <- function(model, data){
+  weights <- data$data$weight
+  anatLmer(model, data = data$data
+         , anat = t(data$anat), weights = weights)
+}
+
+fit_row <-
+  function(i){
+     mes <- model_frame$measures[i]
+     form <- model_frame$model_string[[i]]
+     set_n <- model_frame$set_number[[i]]
+     sp <- model_frame$split[i]
+     miq <- model_frame$match_iq[i]
+     
+     data <- get_data(match_iq = miq, set_number = set_n
+                    , split = sp, measurement = mes)
+
+     fit_model(as.formula(form), data)
+  }
+```
+
+## Fit the models
+
+We'll do this on HPF
+
+
+```{r init_registry, cache = TRUE, dependson = c("setup_functions", "generate_experiment_frame")}
+sa_reg <-
+    makeRegistry("vertexwise_analyses"
+               , packages = c("autismSexDifferences"
+                            , "RMINC"
+                            , "purrr"
+                            , "dplyr"))
+
+sa_reg$cluster.functions <-
+  makeClusterFunctionsTORQUE("torque.tmpl")
+
+sa_reg$default.resources <- 
+    list(nodes = 1
+       , memory = "12G"
+       , walltime = "08:00:00"
+       , max.concurrent.jobs = 2000)
+
+batchExport(reg = sa_reg
+            , export = list(measures = measures
+                          , model_frame = model_frame
+                          , sets_frame = sets_frame
+                          , fit_model = fit_model
+                          , new_sexes = new_sexes
+                          , get_data = get_data))
+
+sa_reg <- sa_reg
+```
+
+## Create Jobs
+
+Add the jobs to the registry
+
+```{r job_creation, cache = TRUE, dependson = "init_registry"}
+job_ids <-
+  batchMap(reg = sa_reg
+         , fit_row
+         , seq_len(nrow(model_frame)))
+
+model_frame$job_id <- job_ids$job.id
+
+sa_reg <- sa_reg
+```
+
+## Run Jobs
+
+Run the jobs and wait
+
+```{r job_submission, cache = TRUE, dependson = "job_creation"}
+submitJobs(reg = sa_reg, job_ids)
+waitForJobs(reg = sa_reg)
+```

@@ -1,0 +1,214 @@
+---
+title: generate_model_selection_assets
+author: Chris Hammill
+date: December 01, 2017
+output: html_document
+---
+
+## Load up
+
+Load in required packages
+
+```{r}
+knitr::opts_chunk$set(cache.lazy = FALSE)
+suppressPackageStartupMessages({
+    library(autismSexDifferences)
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(mice)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+})
+```
+
+
+## Data ingest
+
+Pull in data
+
+```{r pull_data, cache = TRUE}
+load("../../cortical_objects_longi20190527.rda")
+load("model_selection_assets.rda")
+```
+
+## Setup Registry
+
+Create a registry to store the model selection results/jobs
+
+```{r init_registry, cache = TRUE, dependson = "pull_data"}
+ms_reg <-
+    makeRegistry("model_selection"
+               , packages = c("autismSexDifferences"
+                            , "RMINC"
+                            , "purrr"
+                            , "dplyr"))
+
+ms_reg$cluster.functions <-
+  makeClusterFunctionsTORQUE("torque.tmpl")
+
+ms_reg$default.resources <- 
+    list(nodes = 1
+         , memory = "8G"
+         , walltime = "02:00:00")
+```
+
+Set the default resources and export necessary data
+
+## Create Experiment
+
+For each experiment I need to extract the correct predictor matrix,
+subset the measurement matrix, compute the linear model and then
+report the AICc.
+
+```{r experiment_functions, cache = TRUE, dependson = "pull_data"}
+get_data <- function(match_iq, set_number, split, measurement){
+
+  ## Rename for use in filter
+  iq <- match_iq
+  sn <- set_number
+  sp <- split
+  
+  data <-
+    sets_frame %>%
+    filter(match_iq == iq
+         , set_number == sn
+         , split == sp)
+
+  if(nrow(data) != 1)
+    stop("something is wrong with your sets frame")
+
+  full_set <- data$set[[1]]
+  matched_set <- data$matched_set[[1]]
+  pred <- data$pred[[1]]
+  
+  filter_vec <- pred(full_set$iq_native) | full_set$Dx == 0
+  anat <- measures[[measurement]][,filter_vec]
+
+  if(ncol(anat) != nrow(matched_set))
+    stop("The filtration didn't work")
+
+  list(data = matched_set
+     , anat = anat)
+}
+
+AIC_summary <-
+  function(mmod) 
+    c(RMINC:::fixef_summary(mmod), AIC = extractAIC(mmod)[2])
+
+fit_model <- function(model, data){
+  weights <- data$data$weight
+  anatLmer(model, data = data$data
+         , anat = t(data$anat), weights = weights
+         , REML = FALSE
+         , summary_type = AIC_summary)
+}
+
+process_selection_frame_row <-
+  function(i){
+    sel_row <- model_selection_frame[i,]
+    data <- get_data(match_iq = sel_row$match_iq
+                   , set_number = sel_row$set_number
+                   , split = sel_row$split
+                   , measurement = sel_row$measures)
+
+    mod <- fit_model(sel_row$model[[1]], data)
+    mod[,"AIC"]                     
+  }
+```
+
+## Export necessary objects
+
+Now make these objects available to the jobs
+
+```{r export_objs, cache = TRUE, dependson = c("experiment_functions", "init_registry")}
+batchExport(reg = ms_reg
+          , export = list(measures = measures
+                        , model_selection_frame = model_selection_frame
+                        , sets_frame = sets_frame
+                        , AIC_summary = AIC_summary
+                        , fit_model = fit_model
+                        , get_data = get_data))
+```
+## Create and submit Jobs
+
+Now to create the jobs
+
+```{r job_creation, cache = TRUE, dependson = "export_objs"}
+job_ids <-
+  batchMap(reg = ms_reg
+         , process_selection_frame_row
+         , seq_len(nrow(model_selection_frame)))
+
+model_selection_frame$job_id <- job_ids$job.id
+```
+
+Test a job to make sure it at least superficially works
+
+```{r job_test, cache = TRUE, dependson = "job_creation"}
+invisible(testJob(reg = ms_reg, 1))
+```
+Submit the jobs and wait.
+
+```{r job_submission, cache = TRUE, dependson = "test_job"}
+submitJobs(reg = ms_reg, job_ids)
+waitForJobs(reg = ms_reg)
+```
+
+## Aggregate Results
+
+Now that the model selection has been run it's time to analyze the
+results.
+
+```{r model_selection, cache = TRUE, dependson = c("job_submission", "job_creation")}
+ms_reg <- loadRegistry("model_selection")
+model_selection_frame$job_id <- job_ids$job.id
+
+median_evidence_ratios <-
+  model_selection_frame %>%
+  mutate(model_string =
+           sapply(model
+                , function(form)
+                  paste0(deparse(form), collapse = ""))
+         , iq_modelled = grepl("iq", model_string)) %>%
+  group_by(match_iq, split, measures, iq_modelled, set_number) %>%
+  do({
+    data <- as_data_frame(.)
+    data <- mutate(data
+                 , uid = paste(model_string, set_number
+                             , sep = ":"))
+    if(any(duplicated(data$uid)))
+      stop("the model selection groupings are broken")
+
+    res <-
+      reduceResults(rbind, data$job_id, init = NULL, reg = ms_reg)
+
+    if(nrow(res) != nrow(data))
+      stop("The results matrix is probably transposed")
+
+    data %>%
+      mutate(evidence_ratio = apply(apply(res, 2, evidence_ratio), 1, median))
+  })
+```
+
+Now to summarize the model selection results
+
+```{r analyze_model_selection, cache = TRUE, dependson = "model_selection"}
+best_models <-
+  median_evidence_ratios %>%
+  ungroup %>%
+  group_by(match_iq, split, measures, iq_modelled, model_string) %>%
+  summarize(evidence_ratio = mean(evidence_ratio)) %>%
+  arrange(evidence_ratio) %>%
+  slice(1)
+  
+```
+
+```{r write_model_selection_results, cache = TRUE, dependson = "analyze_model_selection"}
+
+save(best_models = best_models
+   , median_evidence_ratios = median_evidence_ratios
+   , get_data = get_data
+   , file = "model_selection_results.rda")
+```

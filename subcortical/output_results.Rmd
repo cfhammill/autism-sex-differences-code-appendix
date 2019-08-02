@@ -1,0 +1,247 @@
+---
+title: output_results
+author: Chris Hammill
+date: December 12, 2017
+output: html_document
+---
+
+## Load up
+
+Load in required packages
+
+```{r}
+suppressPackageStartupMessages({
+    library(autismSexDifferences)
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(mice)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+})
+```
+
+## Get Model Selection Results
+
+```{r load_model_sel, cache = TRUE}
+load("model_selection_results.rda")
+```
+## Get Randomization Results
+
+```{r load_rand_res, cache = TRUE}
+rand_res <- readRDS("./merged_experiments.rds")
+
+rand_res <-
+  rand_res %>%
+  mutate(concordance = lapply(res, getElement, "concordance")
+       , eff_cor = lapply(res, getElement, "eff_cor")
+       , max_mb = sapply(res, getElement, "max_mb")
+       , max_fb = sapply(res, getElement, "max_fb")
+       , max_meff = sapply(res, getElement, "max_meff")
+       , max_feff = sapply(res, getElement, "max_feff"))
+```
+
+## Test some plots
+
+Extract test group
+
+```{r extract_test, cache = TRUE, dependson = "load_rand_res"}
+test_data <- 
+  rand_res %>%
+  nest %>%
+  slice(4) %>%
+  unnest
+```
+
+Test random line version
+
+```{r test_random_concordance_lines, cache = TRUE, dependson = "extract_test"}
+test_data_munged <-
+  test_data %>%
+  select(-eff_cor, -res) %>%
+  mutate(is_shuffled = !is.na(shuffle)) %>%
+  mutate(step = list(seq(1, 90))) %>%
+  unnest
+
+bounds <-
+  test_data_munged %>%
+  filter(is_shuffled) %>%
+  filter(step != 90) %>%
+  ungroup %>%
+  group_by(step) %>%
+  summarize(ub = quantile(concordance, .975)
+          , lb = quantile(concordance, .025))
+
+test_data_munged %>%
+  filter(!is_shuffled | shuffle %in% sample(1:1001, 100)) %>%
+  ggplot(aes(x = step, y = concordance, color = is_shuffled, group = shuffle)) +
+  geom_ribbon(data = bounds, aes(x = step, ymin = lb, ymax = ub
+                               , y = NULL, group = NULL, color = NULL)
+            , fill = "grey") +
+  geom_line() 
+```
+
+After consulting with Ben and Anthony, it looks like I'm going to present
+it this way with randomization intervals for the whole data set plus
+a sample of 100 randomization lines.
+
+Test with effective correlation as well
+
+```{r test_random_effcor_lines, cache = TRUE, dependson = "extract_test"}
+test_data_munged <-
+  test_data %>%
+  select(-concordance, -res) %>%
+  mutate(is_shuffled = !is.na(shuffle)) %>%
+  mutate(quantile_steps =
+           list(c(0
+                , seq(.1, .9, 0.1)
+                , seq(.9, .98, .01)
+                  ))) %>%
+  unnest
+
+bounds <-
+  test_data_munged %>%
+  filter(is_shuffled) %>%
+  ungroup %>%
+  group_by(quantile_steps) %>%
+  summarize(ub = quantile(eff_cor, .975)
+          , lb = quantile(eff_cor, .025))
+
+test_data_munged %>%
+  filter(!is_shuffled | shuffle %in% sample(1:1001, 100)) %>%
+  ggplot(aes(x = quantile_steps, y = eff_cor, color = is_shuffled, group = shuffle)) +
+  geom_ribbon(data = bounds, aes(x = quantile_steps, ymin = lb, ymax = ub
+                               , y = NULL, group = NULL, color = NULL)
+            , fill = "grey") +
+  geom_line() 
+```
+
+Awesome, everything seems to be working. Let's do this for all of them.
+
+## Plot Functions
+
+Create some simple plots of the randomization dists
+
+```{r plot_functions, cache = TRUE}
+plot_concordance <-
+  function(df_chunk){
+    data_munged <-
+      df_chunk %>%
+      select(-eff_cor, -res) %>%
+      mutate(is_shuffled = !is.na(shuffle)) %>%
+      mutate(step = list(seq(1, 90))) %>%
+      unnest
+
+    bounds <-
+      data_munged %>%
+      filter(is_shuffled) %>%
+      filter(step != 90) %>%
+      ungroup %>%
+      group_by(step) %>%
+      summarize(ub = quantile(concordance, .975)
+              , lb = quantile(concordance, .025))
+
+    data_munged %>%
+      filter(!is_shuffled | shuffle %in% sample(1:1001, 100)) %>%
+      ggplot(aes(x = step, y = concordance, color = is_shuffled, group = shuffle)) +
+      geom_ribbon(data = bounds, aes(x = step, ymin = lb, ymax = ub
+                                   , y = NULL, group = NULL, color = NULL)
+                , fill = "grey") +
+      geom_line() 
+  }
+
+plot_similarity <-
+  function(df_chunk){
+    data_munged <-
+      df_chunk %>%
+      select(-concordance, -res) %>%
+      mutate(is_shuffled = !is.na(shuffle)) %>%
+      mutate(quantile_steps =
+               list(c(0
+                    , seq(.1, .9, 0.1)
+                    , seq(.9, .98, .01)
+                    ))) %>%
+      unnest
+
+    bounds <-
+      data_munged %>%
+      filter(is_shuffled) %>%
+      ungroup %>%
+      group_by(quantile_steps) %>%
+      summarize(ub = quantile(eff_cor, .975)
+              , lb = quantile(eff_cor, .025))
+
+   data_munged %>%
+      filter(!is_shuffled | shuffle %in% sample(1:1001, 100)) %>%
+      ggplot(aes(x = quantile_steps, y = eff_cor, color = is_shuffled, group = shuffle)) +
+      geom_ribbon(data = bounds, aes(x = quantile_steps, ymin = lb, ymax = ub
+                                   , y = NULL, group = NULL, color = NULL)
+                , fill = "grey") +
+      geom_line() 
+  }
+
+create_fig_name <-
+  function(root, df_chunk){
+    first_row <- purrr::transpose(df_chunk) %>% first
+    names(first_row) <- names(df_chunk)
+
+    iq_match <-
+      `if`(first_row$match_iq
+         , "iqMatched"
+         , "iqNotMatched")
+
+    iq_model <-
+      `if`(first_row$iq_modelled
+         , "iqModelled"
+         , "iqNotModelled")
+
+    measure <- first_row$measures
+
+    split <- switch(as.character(first_row$split)
+                 ,  `x > 100` = "ageGT100"
+                 , `x <= 100` = "ageLTE100"
+                 , `x > 85` = "ageGT85"
+                 , `x <= 85` = "ageLTE85"
+                 , `TRUE` = "ageAny")
+
+    paste0(
+      paste(root, split, measure, iq_match, iq_model, sep = "_")
+    , ".png")
+  }
+```
+
+Now to run them
+
+```{r generate_figures, cache = TRUE, dependson = c("plot_functions", "load_rand_res")}
+if(!file.exists("figures"))
+  dir.create("figures")
+
+walk(seq_len(n_groups(rand_res)), function(i){
+  data <-
+    rand_res %>%
+    nest %>%
+    slice(i) %>%
+    unnest
+    
+  conc_fig_name <-
+    file.path("figures"
+            , create_fig_name("concordance", data))
+
+  png(conc_fig_name, width = 2048, height = 1024)
+  print(plot_concordance(data))
+  dev.off()
+
+  sim_fig_name <-
+    file.path("figures"
+            , create_fig_name("similarity", data))
+
+  png(sim_fig_name, width = 2048, height = 1024)
+  print(plot_similarity(data))
+  dev.off()
+})
+
+system("touch figures_done.txt")
+```
+
+

@@ -1,0 +1,214 @@
+---
+title: process_spatial_analyses
+author: Chris Hammill
+date: January 02, 2018
+output: html_document
+---
+
+## Load up
+
+Load in required packages
+
+```{r}
+knitr::opts_chunk$set(cache.lazy = FALSE)
+suppressPackageStartupMessages({
+    library(autismSexDifferences)
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(mice)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+})
+```
+
+## Get Registry
+
+```{r load_registry, cache = TRUE}
+sa_reg <- loadRegistry("spatial_analyses")
+```
+
+## Functions
+
+Create some functions for processing the data
+
+```{r processing_functions}
+process_randomization <- function(mod){
+        max_t <- max(abs(mod[,"tvalue-Dx"])
+                   , abs(mod[,"tvalue-sex:Dx"]))
+        
+        steps <- seq(0,max_t, length.out = 90)
+
+
+        mt <- mod[,"tvalue-Dx"]
+        ft <- mod[,"tvalue-sex:Dx"]
+        concordance <-
+          sapply(steps, function(t){            
+            verts <-
+              abs(mt) > t |
+              abs(ft) > t
+            
+            sum(sign(mt[verts]) ==
+                sign(ft[verts])) /
+                    sum(verts)                
+          })
+
+        male_eff <- mod[,"beta-Dx"]
+        female_eff <- mod[,"beta-Dx"] + mod[,"beta-sex:Dx"]
+
+        quantile_steps <- c(0
+                          , seq(.1, .9, 0.1)
+                          , seq(.9, .98, .01))
+
+        mq <- quantile(abs(male_eff), quantile_steps)
+        fq <- quantile(abs(female_eff), quantile_steps)
+
+        eff_cor <-
+            mapply(function(mq, fq){
+              #                male_eff[abs(male_eff) < mq] <- 0
+              #                female_eff[abs(female_eff) < fq] <- 0
+              mf <- male_eff[abs(male_eff) >= mq | abs(female_eff) >= fq]
+              ff <- female_eff[abs(male_eff) >= mq | abs(female_eff) >= fq]
+              #  cor(female_eff, male_eff)
+              cor(mf, ff)
+            }, mq = mq, fq = fq)
+
+        max_mb <- max(abs(mod[,"tvalue-Dx"]))
+        max_fb <- max(abs(mod[,"tvalue-sex:Dx"]))
+        max_meff <- max(abs(mod[,"beta-Dx"]))
+        max_feff <- max(abs(mod[,"beta-sex:Dx"]))
+        
+        list(concordance = concordance
+           , eff_cor = eff_cor
+           , max_mb = max_mb
+           , max_fb = max_fb
+           , max_meff = max_meff
+           , max_feff = max_feff)
+}
+
+fast_dim3_mean <- Rcpp::cppFunction("
+NumericMatrix fast_dim3_mean(NumericVector arr, IntegerVector dims){
+  NumericMatrix out(dims(0), dims(1));
+  int in_counter = 0;
+
+  for(int k = 0; k < dims(2); ++k){
+    for(int j = 0; j < dims(1); ++j){
+      for(int i = 0; i < dims(0); ++i){
+        out(i,j) += arr(in_counter)/dims(2);
+        ++in_counter;
+      }
+    }
+  }
+
+  return(out);
+}
+")
+
+average_mim_chunk <-
+  function(df_chunk, reg){      
+    res_list <-
+      lapply(df_chunk$job_id
+           , function(i){
+             readRDS(batchtools:::getResultFiles(reg = reg, i))
+           })
+    
+    res_arr <- simplify2array(res_list)
+    averaged_res <- fast_dim3_mean(res_arr, dim(res_arr))
+    attributes(averaged_res) <- attributes(res_list[[1]])
+    process_randomization(averaged_res)
+  }
+
+original_average_mim_chunk <-
+  function(df_chunk, reg){
+    res_list <-
+      lapply(df_chunk$job_id
+           , function(i){
+             process_randomization(readRDS(batchtools:::getResultFiles(reg = reg, i)))
+           })
+
+    concordance <-
+      lapply(res_list, getElement, "concordance") %>%
+      Reduce(cbind, .) %>%
+      as.matrix %>%
+      rowMeans
+    
+    eff_cor <-
+      lapply(res_list, getElement, "eff_cor") %>%
+      Reduce(cbind, .) %>%
+      as.matrix %>%
+      rowMeans
+
+    max_mb <- mean(sapply(res_list, getElement, "max_mb"))
+    max_fb <- mean(sapply(res_list, getElement, "max_fb"))
+    max_meff <- mean(sapply(res_list, getElement, "max_meff"))
+    max_feff <- mean(sapply(res_list, getElement, "max_feff"))
+    
+    list(
+      list(concordance = concordance
+         , eff_cor = eff_cor
+         , max_mb = max_mb
+         , max_fb = max_fb
+         , max_meff = max_meff
+         , max_feff = max_feff))
+  }
+```
+
+## Process All
+
+Process the bulk run
+
+```{r process_sa_reg, cache = TRUE, dependson = "process_example"}
+if(!nrow(findDone()) == 18018){
+  stop("Something is amiss, there should be 18018 finished jobs, "
+     , "and 18 fails (shuffle 1001 doesn't exist)")
+}
+sa_res <-
+  randomization_experiments %>%
+  ungroup %>% ## Extract all complete 
+  mutate(job_id = findJobs(reg = sa_reg)$job.id) %>%
+  filter(job_id %in% findDone(reg = sa_reg)$job.id) %>%
+  group_by(match_iq, measures, iq_modelled, split) %>%
+  do({
+    data <- as_data_frame(.)
+    if(any(sapply(., length) != nrow(data)))
+      stop("something is broken with the experiment frame")
+
+    data %>%
+      group_by(shuffle) %>%
+      do(res = { average_mim_chunk(as_data_frame(.), reg = sa_reg) })
+  })
+```
+
+## Process all old style
+
+Bring in the small fixup reg (shouldn't be needed anymore)
+
+```{r old_res, cache = TRUE, dependson = "process_sa_reg"}
+sa_res_old <-
+  randomization_experiments %>%
+  ungroup %>%
+  mutate(job_id = findJobs(reg = sa_reg)$job.id) %>%
+  filter(job_id %in% findDone(reg = sa_reg)$job.id) %>%
+  group_by(match_iq, measures, iq_modelled, split) %>%
+  do({
+    data <- as_data_frame(.)
+    if(any(sapply(., length) != nrow(data)))
+      stop("something is broken with the experiment frame")
+
+    data %>%
+      group_by(shuffle) %>%
+      do(res = { original_average_mim_chunk(as_data_frame(.), reg = sa_reg) })
+  })
+```
+
+Now process the results
+
+Merge result and save
+
+```{r merge_and_save, cache = TRUE, dependson = "old_res"}
+saveRDS(sa_res_old, "original_merged_experiment.rds")
+saveRDS(
+  sa_res
+, "merged_experiments.rds")
+```

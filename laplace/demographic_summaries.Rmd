@@ -1,0 +1,101 @@
+---
+title: Sex Difference Summaries
+author: Chris Hammill
+date: February 28, 2018
+output: html_document
+---
+
+First we'll load in the longitudinal data
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
+
+load("../../cortical_objects_longi20190527.rda")
+```
+
+We'll concern ourselves with `civet_deduped`, somewhat deceptively named in
+that the longitudinal data is still in there but it has been QC filtered.
+
+## Overall scan breakdown
+
+```{r}
+civet_deduped %>% with(table(Dx, sex))
+
+civet_deduped %>%
+  group_by(subject) %>%
+  with(table(Dx, sex))
+```
+
+## Breakdown of scans first vs. later
+
+```{r}
+civet_deduped %>%
+  group_by(subject) %>%
+  mutate(scan_n = length(scan)
+       , longi = scan_n > 1) %>%
+  filter(!duplicated(subject)) %>%
+  with(table(Dx, sex, longi))
+```
+
+## Breakdown of proportion of scans that aren't first
+
+```{r}
+civet_deduped %>%
+  group_by(subject) %>%
+  mutate(scan_n = length(scan)
+       , longi = scan_n > 1) %>%
+  filter(!duplicated(subject)) %>%
+  with(tapply(longi, list(Dx, sex), mean))
+```
+
+## Age breakdown by group
+
+Mean ages
+
+```{r}
+civet_deduped %>%
+  group_by(Dx, sex) %>%
+  summarize(mean_age = mean(age_scan))
+```
+
+Age histograms
+
+```{r}
+civet_deduped %>%
+  mutate(sex_dx = paste(sex, Dx, sep = ":")) %>%
+  ggplot(aes(x = age_scan, group = sex_dx)) +
+  geom_histogram() +
+  facet_wrap(~ sex_dx)
+ggsave("age_hists.png", width = 12, height = 6)
+
+civet_deduped$age_scan %>% range
+```
+
+## IQ breakdown by group
+
+IQ means
+
+```{r}
+civet_deduped %>%
+  filter(!duplicated(subject)) %>%
+  group_by(Dx, sex) %>%
+  summarize(mean_iq = mean(iq, na.rm = TRUE))
+```
+
+IQ histograms
+
+```{r}
+civet_deduped %>%
+  filter(!duplicated(subject)) %>%
+  mutate(sex_dx = paste(sex, Dx, sep = ":")) %>%
+  ggplot(aes(x = iq, group = sex_dx)) +
+  geom_histogram() +
+  facet_wrap(~ sex_dx)
+```
+
+
+
+

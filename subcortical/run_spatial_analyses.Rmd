@@ -1,0 +1,242 @@
+---
+title: run_spatial_analyses
+author: Chris Hammill
+date: December 28, 2017
+output: html_document
+---
+
+## Load up
+
+Load in required packages
+
+```{r}
+knitr::opts_chunk$set(cache.lazy = FALSE)
+suppressPackageStartupMessages({
+    library(autismSexDifferences)
+    library(RMINC)
+    library(purrr)
+    library(dplyr)
+    library(mice)
+    library(batchtools)
+    library(tidyr)
+    library(ggplot2)
+})
+```
+
+
+## Data ingest
+
+Pull in data
+
+```{r pull_data, cache = TRUE}
+load("../cortical_objects_longi20180115.rda")
+
+complete_measures <- ## needs to be done before loading the next rdas
+  model_data %>%
+  select(##matches("lobeVolume_")
+    Vermal_I_II:right.ventral.posterior.nucleus) %>%
+  as.matrix %>%
+  complete.cases
+
+load("model_selection_assets.rda")
+load("model_selection_results.rda")
+```
+
+## Set up randomization grid
+
+Now to join the best models back to the experiment
+frame
+
+```{r generate_experiment_frame, cache = TRUE}
+randomization_experiments <-
+  inner_join(best_models, experiment_frame %>% select(-set)
+           , by = c("match_iq", "split"))
+
+if(nrow(randomization_experiments) != 18)
+  stop("merging went wrong")
+
+randomization_experiments <-
+  crossing(randomization_experiments, shuffle = c(1:1001, NA))
+```
+
+## Set up analysis function
+
+Here is the work-horse function for computing the randomization
+
+```{r setup_function, cache = TRUE}
+get_data <- function(match_iq, set_number, split, measurement){
+
+  ## Rename for use in filter
+  iq <- match_iq
+  sn <- set_number
+  sp <- split
+  
+  data <-
+    sets_frame %>%
+    filter(match_iq == iq
+         , set_number == sn
+         , split == sp)
+
+  if(nrow(data) != 1)
+    stop("something is wrong with your sets frame")
+
+  full_set <- data$set[[1]]
+  matched_set <- data$matched_set[[1]]
+  pred <- data$pred[[1]]
+  
+  filter_vec <-
+    pred(full_set$iq_native) | full_set$Dx == 0
+    
+  
+  anat <- measures[[measurement]][,filter_vec]
+
+  if(ncol(anat) != nrow(matched_set))
+    stop("The filtration didn't work")
+
+  list(data = matched_set
+     , anat = anat
+     , filter_vec = filter_vec)
+}
+
+fit_model <- function(model, data){
+  weights <- data$data$weight
+  anatLmer(model, data = data$data
+         , anat = t(data$anat), weights = weights)
+}
+
+purge_environments <- function(mod){
+  environment(attributes(mod)$mincLmerList[[1]]$formula) <- NULL
+  environment(attr(attributes(mod)$mincLmerList[[1]]$fr, "formula")) <- NULL
+  environment(attr(attributes(mod)$mincLmerList[[1]]$fr, "terms")) <- NULL
+  
+  mod
+}
+
+run_randomization <-
+  function(i){
+    gc()
+    gc()
+
+    mes <- randomization_experiments$measures[i]
+    form <- randomization_experiments$model_string[[i]]
+    set_n <- randomization_experiments$set_number[[i]]
+    sp <- randomization_experiments$split[i]
+    miq <- randomization_experiments$match_iq[i]
+    
+    data <- get_data(match_iq = miq, set_number = set_n
+                   , split = sp, measurement = mes)
+
+    shuf_ind <- randomization_experiments$shuffle[i]
+    if(!is.na(shuf_ind)){
+      subset_sexes <- new_sexes[complete_measures,]
+      data$data$sex <-
+        ifelse(subset_sexes[data$filter_vec,shuf_ind] == "M", 0, 1)
+
+    } else {
+      data$data$sex <- ifelse(data$data$sex == "M", 0, 1)
+    }
+    
+    mod <- fit_model(as.formula(form), data)
+    mod <- fit_model(as.formula(form), data)
+    attr(mod, "anat") <- NULL
+    mod <- purge_environments(mod)
+    
+    mod
+  }
+```
+## Set up registry
+
+Now to intialize the registry
+
+```{r init_registry, cache = TRUE, dependson = c("setup_function", "generate_experiment_frame")}
+sa_reg <-
+    makeRegistry("spatial_analyses"
+               , packages = c("autismSexDifferences"
+                            , "RMINC"
+                            , "purrr"
+                            , "dplyr"))
+
+sa_reg$cluster.functions <-
+  makeClusterFunctionsTORQUE("torque.tmpl")
+
+sa_reg$default.resources <- 
+    list(nodes = 1
+       , memory = "12G"
+       , walltime = "08:00:00"
+       , max.concurrent.jobs = 2000)
+
+batchExport(reg = sa_reg
+            , export = list(measures = measures
+                          , randomization_experiments = randomization_experiments
+                          , sets_frame = sets_frame
+                          , fit_model = fit_model
+                          , shuffles = shuffles
+                          , get_data = get_data
+                          , new_sexes = new_sexes
+                          , purge_environments = purge_environments
+                          , complete_measures = complete_measures
+                            ))
+
+sa_reg <- sa_reg
+```
+
+## Create Jobs
+
+Add the jobs to the registry
+
+```{r job_creation, cache = TRUE, dependson = "init_registry"}
+job_ids <-
+  batchMap(reg = sa_reg
+         , run_randomization
+         , seq_len(nrow(randomization_experiments)))
+
+randomization_experiments$job_id <- job_ids$job.id
+
+## job_ids[, chunk :=
+##             chunk(seq_len(nrow(randomization_experiments))
+##                 , chunk.size = 4)]
+
+sa_reg <- sa_reg
+```
+
+## Test Job
+
+Run a test job
+
+```{r test_job, cache = TRUE, dependson = "job_creation"}
+#invisible(testJob(reg = sa_reg, 20000)) 
+```
+
+## Run Jobs
+
+Run the jobs and wait
+
+```{r job_submission, cache = TRUE, dependson = "test_job"}
+submitJobs(reg = sa_reg, job_ids)
+waitForJobs(reg = sa_reg)
+```
+
+## Fix jobs that failed
+
+```{r job_fixes, cache = TRUE, dependson = "job_submission"}
+sa_reg <- loadRegistry("spatial_analyses", writeable = TRUE)
+
+sa_reg$cluster.functions <-
+  makeClusterFunctionsTORQUE("torque.tmpl")
+
+sa_reg$default.resources <- 
+    list(nodes = 1
+       , memory = "12G"
+       , walltime = "08:00:00"
+       	 , max.concurrent.jobs = 2000)
+	 
+not_done <- findNotDone(reg = sa_reg)
+submitJobs(reg = sa_reg, not_done)
+waitForJobs(reg = sa_reg)
+```
+
+## Flag Finished
+
+```{r finalize, cache = TRUE, dependson = "fixup"}
+system("touch spatial_analyses_finished.txt")
+```
